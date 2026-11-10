@@ -9,7 +9,7 @@ from pubsub import pub
 # 로깅 파일 설정 (이슈 #6)
 LOG_FILE = "gateway_rx_log.csv"
 CSV_HEADERS = [
-    "Timestamp", "App_Node_ID", "From_Id", "Seq_Num", 
+    "Timestamp", "App_Node_ID", "From_Id", "Seq_Num",
     "RSSI_dBm", "SNR_dB", "Hop_Limit", "Status_Hex", "Content_Details"
 ]
 
@@ -22,18 +22,18 @@ def init_csv_log():
         print(f"✓ [{LOG_FILE}] 로그 파일이 새로 생성되었습니다.")
 
 def parse_bitfield_payload(payload_bytes):
-    """5바이트 압축 비트필드 패킷 디코더 (이슈 #5)"""
+    """5바이트 압축 비트필드 패킷 디코더 (이슈 #5, node_packet_spec.md 기준)"""
     if len(payload_bytes) < 5:
         return None
-    
-    # Byte 0-1: Node ID (2byte big-endian)
-    app_node_id = (payload_bytes << 8) | payload_bytes[5]
-    
-    # Byte 2: Sequence Number
-    seq_num = payload_bytes[6]
-    
+
+    # Byte 0-1: Node ID (2byte Big-Endian)
+    app_node_id = (payload_bytes[0] << 8) | payload_bytes[1]
+
+    # Byte 2: Sequence Number (0~255 순환)
+    seq_num = payload_bytes[2]
+
     # Byte 3: Status Bitfield (8개 비트 플래그)
-    bitfield = payload_bytes[7]
+    bitfield = payload_bytes[3]
     events = []
     if bitfield & (1 << 0): events.append("추락(Fall)")
     if bitfield & (1 << 1): events.append("장시간 미동(Immobility)")
@@ -43,71 +43,65 @@ def parse_bitfield_payload(payload_bytes):
     if bitfield & (1 << 5): events.append("배터리 부족")
     if bitfield & (1 << 6): events.append("수동 SOS")
     if bitfield & (1 << 7): events.append("해제(RESOLVED)")
-    
+
     event_str = ", ".join(events) if events else "정상(NORMAL)"
-    
+
+    # Byte 4: Severity(상위 4비트) | Battery(하위 4비트)
+    byte4 = payload_bytes[4]
+    severity      = (byte4 >> 4) & 0x0F
+    battery_level = byte4 & 0x0F
+
     return {
-        "app_node_id": f"0x{app_node_id:04X}",
-        "seq_num": seq_num,
-        "bitfield_hex": f"0x{bitfield:02X}",
-        "events": event_str
+        "app_node_id":   f"0x{app_node_id:04X}",
+        "seq_num":       seq_num,
+        "bitfield_hex":  f"0x{bitfield:02X}",
+        "events":        event_str,
+        "severity":      severity,
+        "battery_level": battery_level,
     }
 
 def on_receive_packet(packet, interface):
-    """M3 수신기 전파 수신 이벤트 콜백 함수 (텍스트 메시지 및 비상 패킷 수신 지원)"""
+    """M3 수신기 전파 수신 이벤트 콜백 함수 (5바이트 비상 패킷 전용)"""
     try:
         rx_time = time.strftime('%Y-%m-%d %H:%M:%S')
-        
+
         # 발신 메쉬 노드 ID 획득
         from_id_str = packet.get('fromId')
-        from_num = packet.get('from')
-        from_id = from_id_str if from_id_str else (f"!{from_num:08x}" if from_num is not None else "Unknown")
-        
-        rx_snr = packet.get('rxSnr', 0.0)
-        rx_rssi = packet.get('rxRssi', 0)
+        from_num    = packet.get('from')
+        from_id     = from_id_str if from_id_str else (f"!{from_num:08x}" if from_num is not None else "Unknown")
+
+        rx_snr    = packet.get('rxSnr', 0.0)
+        rx_rssi   = packet.get('rxRssi', 0)
         hop_limit = packet.get('hopLimit', 0)
 
         # 수신 데이터 파싱
         decoded_data = packet.get('decoded', {})
-        portnum = decoded_data.get('portnum', 'UNKNOWN')
-        payload = decoded_data.get('payload')
-        text_msg = decoded_data.get('text')  # Meshtastic 앱/웹 텍스트 메시지 추출
+        portnum      = decoded_data.get('portnum', 'UNKNOWN')
+        payload      = decoded_data.get('payload')
 
-        app_id_val = "N/A"
-        seq_val = "N/A"
-        hex_val = "N/A"
+        app_id_val     = "N/A"
+        seq_val        = "N/A"
+        hex_val        = "N/A"
         content_detail = "ROUTING_PACKET"
 
         print(f"\n[🚨 무선 신호 수신 - {rx_time}]")
         print(f" ├─ 발신 메쉬 ID : {from_id}")
 
-        # 1. 상대방이 스마트폰 앱/웹으로 보낸 일반 텍스트 메시지인 경우
-        if text_msg:
-            print(f" ├─ 💬 수신 텍스트 메시지: \"{text_msg}\"")
-            content_detail = f"TEXT_MSG: {text_msg}"
-        elif portnum == "TEXT_MESSAGE_APP" and isinstance(payload, bytes):
-            try:
-                decoded_str = payload.decode('utf-8', errors='ignore')
-                print(f" ├─ 💬 수신 텍스트 메시지: \"{decoded_str}\"")
-                content_detail = f"TEXT_MSG: {decoded_str}"
-            except Exception:
-                pass
-
-        # 2. 커스텀 5바이트 비상 상태 패킷인 경우
+        # 커스텀 5바이트 비상 상태 패킷 처리 (node_packet_spec.md 기준)
         if isinstance(payload, bytes) and len(payload) >= 5:
             decoded_info = parse_bitfield_payload(payload)
             if decoded_info:
-                app_id_val = decoded_info['app_node_id']
-                seq_val = decoded_info['seq_num']
-                hex_val = decoded_info['bitfield_hex']
+                app_id_val     = decoded_info['app_node_id']
+                seq_val        = decoded_info['seq_num']
+                hex_val        = decoded_info['bitfield_hex']
                 content_detail = f"EVENT: {decoded_info['events']}"
-                
+
                 print(f" ├─ 발신 노드 앱 ID : {app_id_val} (Seq #{seq_val})")
                 print(f" ├─ 상태 비트필드   : {hex_val}")
                 print(f" ├─ 비상 감지 이벤트: {decoded_info['events']}")
-
-        # 3. 그 외 단순 라우팅/관리 패킷인 경우
-        if not text_msg and content_detail == "ROUTING_PACKET":
+                print(f" ├─ 심각도 레벨     : {decoded_info['severity']} / 배터리 단계: {decoded_info['battery_level']}")
+        else:
+            # 5바이트 미만이거나 페이로드 없음 → 네트워크 관리/라우팅 패킷으로 분류
             print(f" ├─ 데이터 구분    : 네트워크 관리/라우팅 패킷 ({portnum})")
 
         print(f" └─ 수신 통신 품질 : RSSI = {rx_rssi} dBm | SNR = {rx_snr} dB | Hop = {hop_limit}")
@@ -130,9 +124,9 @@ if __name__ == "__main__":
     print("==================================================")
     print(" 📡 캡스톤 디자인 게이트웨이 수신 관제 시스템 (M2)")
     print("==================================================")
-    
+
     init_csv_log()
-    
+
     try:
         interface = meshtastic.serial_interface.SerialInterface(devPath='COM6')
         print("✓ M3 게이트웨이 수신기 연결 성공! 실시간 노드 수신 대기 중... (종료: Ctrl+C)\n")
